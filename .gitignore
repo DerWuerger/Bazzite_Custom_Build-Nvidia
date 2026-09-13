@@ -1,6 +1,14 @@
 cosign.key
 _build_*
 output
+output/
+OUTPUT/
+*.iso
+*.iso.sha256
+*.log
+*.status
+github-artifacts
+github-artifacts/
 _build-*/**
 *_chunkah_*
 *_rpm-ostree_*

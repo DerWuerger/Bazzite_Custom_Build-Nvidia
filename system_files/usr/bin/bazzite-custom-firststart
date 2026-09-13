@@ -1,0 +1,296 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+LOG_FILE="/var/log/bazzite-custom-firststart.log"
+STATE_DIR="/var/lib/bazzite-custom"
+SUDOERS_FILE="/etc/sudoers.d/90-bazzite-custom-firststart"
+PLUGIN_STORE_URL="https://plugins.deckbrew.xyz/plugins"
+PLUGIN_CDN_PREFIX="https://cdn.tzatzikiweeb.moe/file/steam-deck-homebrew/versions"
+FLATHUB_URL="https://dl.flathub.org/repo/flathub.flatpakrepo"
+FLATPAKS=(
+  "com.discordapp.Discord"
+  "com.google.Chrome"
+  "org.videolan.VLC"
+)
+DECKY_PLUGINS=(
+  "SteamGridDB"
+  "HLTB for Deck"
+  "ProtonDB Badges"
+)
+
+mkdir -p "$STATE_DIR"
+touch "$LOG_FILE"
+exec >>"$LOG_FILE" 2>&1
+
+echo "==== Bazzite custom first-start: $(date -Is) ===="
+
+exec 9>/run/bazzite-custom-firststart.lock
+if ! flock -n 9; then
+  echo "Another first-start run is active; exiting."
+  exit 0
+fi
+
+find_target_user() {
+  local session_id session_uid session_user _rest state
+
+  if command -v loginctl >/dev/null 2>&1; then
+    while read -r session_id session_uid session_user _rest; do
+      [[ -z "${session_id:-}" || -z "${session_uid:-}" || -z "${session_user:-}" ]] && continue
+      [[ "$session_uid" =~ ^[0-9]+$ ]] || continue
+      (( session_uid >= 1000 && session_uid < 60000 )) || continue
+      state="$(loginctl show-session "$session_id" -p State --value 2>/dev/null || true)"
+      if [[ "$state" == "active" || "$state" == "online" ]]; then
+        echo "$session_user"
+        return 0
+      fi
+    done < <(loginctl list-sessions --no-legend 2>/dev/null || true)
+  fi
+
+  while IFS=: read -r name _ uid _ _ home shell; do
+    [[ "$uid" =~ ^[0-9]+$ ]] || continue
+    (( uid >= 1000 && uid < 60000 )) || continue
+    [[ -d "$home" ]] || continue
+    [[ "$shell" == */nologin || "$shell" == */false ]] && continue
+    echo "$name"
+    return 0
+  done </etc/passwd
+
+  return 1
+}
+
+retry() {
+  local attempts="$1"
+  local delay="$2"
+  shift 2
+
+  local n=1
+  until "$@"; do
+    if (( n >= attempts )); then
+      return 1
+    fi
+    echo "Command failed, retrying in ${delay}s: $*"
+    sleep "$delay"
+    ((n++))
+  done
+}
+
+run_as_user() {
+  local user="$1"
+  local home="$2"
+  shift 2
+
+  runuser -u "$user" -- env "USER=$user" "LOGNAME=$user" "HOME=$home" "SUDO_USER=$user" "$@"
+}
+
+install_system_flatpaks() {
+  echo "Ensuring Flathub system remote exists."
+  flatpak remote-add --system --if-not-exists flathub "$FLATHUB_URL"
+
+  echo "Installing requested system Flatpaks."
+  flatpak install --system --noninteractive -y flathub "${FLATPAKS[@]}"
+}
+
+with_temporary_sudo() {
+  local user="$1"
+  shift
+  local result
+
+  if [[ -e "$SUDOERS_FILE" ]]; then
+    rm -f "$SUDOERS_FILE"
+  fi
+
+  printf '%s ALL=(ALL) NOPASSWD: ALL\n' "$user" >"$SUDOERS_FILE"
+  chmod 0440 "$SUDOERS_FILE"
+
+  if command -v visudo >/dev/null 2>&1; then
+    visudo -cf "$SUDOERS_FILE"
+  fi
+
+  set +e
+  "$@"
+  result=$?
+  set -e
+  rm -f "$SUDOERS_FILE"
+  return "$result"
+}
+
+ensure_decky_loader() {
+  local user="$1"
+  local home="$2"
+  local status
+
+  status="$(run_as_user "$user" "$home" ujust setup-decky status 2>/dev/null || true)"
+  if [[ "$status" == "install" || "$status" == "install-prerelease" ]]; then
+    echo "Decky Loader is already installed: $status"
+    return 0
+  fi
+
+  echo "Installing Decky Loader via Bazzite ujust."
+  with_temporary_sudo "$user" run_as_user "$user" "$home" ujust setup-decky install
+
+  status="$(run_as_user "$user" "$home" ujust setup-decky status 2>/dev/null || true)"
+  [[ "$status" == "install" || "$status" == "install-prerelease" ]]
+}
+
+plugin_version_installed() {
+  local home="$1"
+  local plugin_name="$2"
+
+  python3 - "$home" "$plugin_name" <<'PY'
+import json
+import pathlib
+import sys
+
+home = pathlib.Path(sys.argv[1])
+wanted = sys.argv[2]
+plugins_dir = home / "homebrew" / "plugins"
+if not plugins_dir.is_dir():
+    sys.exit(1)
+
+for manifest in plugins_dir.glob("*/plugin.json"):
+    try:
+        data = json.loads(manifest.read_text(encoding="utf-8"))
+    except Exception:
+        continue
+    if data.get("name") == wanted:
+        print(data.get("version", ""))
+        sys.exit(0)
+sys.exit(1)
+PY
+}
+
+resolve_plugin() {
+  local plugin_name="$1"
+  local store_file
+
+  store_file="$(mktemp)"
+  curl -fsSL --retry 3 --connect-timeout 20 "$PLUGIN_STORE_URL" >"$store_file"
+  python3 - "$plugin_name" "$PLUGIN_CDN_PREFIX" "$store_file" <<'PY'
+import json
+import sys
+
+wanted = sys.argv[1]
+cdn = sys.argv[2]
+store_file = sys.argv[3]
+
+with open(store_file, encoding="utf-8") as f:
+    plugins = json.load(f)
+
+for plugin in plugins:
+    if plugin.get("name") != wanted:
+        continue
+    versions = plugin.get("versions") or []
+    if not versions:
+        break
+    version = versions[0]
+    artifact = version.get("artifact") or f"{cdn}/{version['hash']}.zip"
+    print(json.dumps({
+        "name": plugin["name"],
+        "version": version["name"],
+        "hash": version["hash"],
+        "artifact": artifact,
+    }))
+    sys.exit(0)
+
+raise SystemExit(f"Plugin not found in Deckbrew store: {wanted}")
+PY
+  rm -f "$store_file"
+}
+
+install_decky_plugin() {
+  local user="$1"
+  local home="$2"
+  local plugin_name="$3"
+  local info version artifact hash installed_version temp_dir zip_file extract_dir plugin_dir dest_dir actual_hash manifest_name
+
+  info="$(resolve_plugin "$plugin_name")"
+  version="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["version"])' "$info")"
+  artifact="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["artifact"])' "$info")"
+  hash="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["hash"])' "$info")"
+
+  installed_version="$(plugin_version_installed "$home" "$plugin_name" 2>/dev/null || true)"
+  if [[ "$installed_version" == "$version" ]]; then
+    echo "$plugin_name $version is already installed."
+    return 0
+  fi
+
+  echo "Installing Decky plugin: $plugin_name $version"
+  mkdir -p "$home/homebrew/plugins"
+  chown -R "$user:$user" "$home/homebrew"
+
+  temp_dir="$(mktemp -d)"
+  zip_file="$temp_dir/plugin.zip"
+  extract_dir="$temp_dir/extract"
+  mkdir -p "$extract_dir"
+
+  curl -fL --retry 3 --connect-timeout 20 -o "$zip_file" "$artifact"
+  actual_hash="$(sha256sum "$zip_file" | awk '{print $1}')"
+  if [[ "$actual_hash" != "$hash" ]]; then
+    echo "Checksum mismatch for $plugin_name: expected $hash, got $actual_hash"
+    rm -rf "$temp_dir"
+    return 1
+  fi
+
+  python3 -m zipfile -e "$zip_file" "$extract_dir"
+  plugin_dir="$(find "$extract_dir" -mindepth 2 -maxdepth 2 -name plugin.json -type f -printf '%h\n' | head -n 1)"
+  if [[ -z "$plugin_dir" ]]; then
+    plugin_dir="$(find "$extract_dir" -mindepth 1 -maxdepth 1 -name plugin.json -type f -printf '%h\n' | head -n 1)"
+  fi
+  if [[ -z "$plugin_dir" || ! -f "$plugin_dir/plugin.json" ]]; then
+    echo "No Decky plugin manifest found in $plugin_name artifact."
+    rm -rf "$temp_dir"
+    return 1
+  fi
+
+  manifest_name="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8")).get("name", ""))' "$plugin_dir/plugin.json")"
+  if [[ "$manifest_name" != "$plugin_name" ]]; then
+    echo "Manifest name mismatch for $plugin_name: got $manifest_name"
+    rm -rf "$temp_dir"
+    return 1
+  fi
+
+  dest_dir="$home/homebrew/plugins/$plugin_name"
+  rm -rf "$dest_dir"
+  mv "$plugin_dir" "$dest_dir"
+  chown -R "$user:$user" "$dest_dir"
+  find "$dest_dir" -name "*.sh" -exec chmod +x {} \; 2>/dev/null || true
+  find "$dest_dir" -name "*.py" -exec chmod +x {} \; 2>/dev/null || true
+  rm -rf "$temp_dir"
+}
+
+restart_decky_loader() {
+  if systemctl list-unit-files plugin_loader.service >/dev/null 2>&1; then
+    systemctl restart plugin_loader.service || true
+  fi
+}
+
+target_user="$(find_target_user || true)"
+if [[ -z "${target_user:-}" ]]; then
+  echo "No regular target user exists yet; will retry."
+  exit 1
+fi
+
+target_home="$(getent passwd "$target_user" | cut -d: -f6)"
+marker_dir="$target_home/.local/state"
+marker_file="$marker_dir/bazzite-custom-firststart.done"
+
+if [[ -f "$marker_file" ]]; then
+  echo "First-start marker already exists for $target_user."
+  exit 0
+fi
+
+echo "Target user: $target_user ($target_home)"
+retry 3 30 install_system_flatpaks
+retry 3 30 ensure_decky_loader "$target_user" "$target_home"
+
+for plugin in "${DECKY_PLUGINS[@]}"; do
+  retry 3 30 install_decky_plugin "$target_user" "$target_home" "$plugin"
+done
+
+restart_decky_loader
+
+mkdir -p "$marker_dir"
+touch "$marker_file"
+chown -R "$target_user:$target_user" "$marker_dir"
+echo "Bazzite custom first-start completed successfully for $target_user."

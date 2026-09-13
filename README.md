@@ -1,3 +1,45 @@
+# Bazzite Custom Build - Nvidia
+
+Private local-build project for a one-off custom Bazzite Deck Nvidia installer ISO.
+
+This project is based on the official Universal Blue `image-template`, but the intended build path is local only:
+
+- Base image: `ghcr.io/ublue-os/bazzite-deck-nvidia:stable`
+- Local custom image: `localhost/bazzite-custom-deck-nvidia:stable`
+- Output ISO: `D:\Bazzite-Custom\OUTPUT\Bazzite-Custom-Deck-NVIDIA.iso`
+- Output checksum: `D:\Bazzite-Custom\OUTPUT\Bazzite-Custom-Deck-NVIDIA.iso.sha256`
+
+The generated ISO/output files, logs, and status files are intentionally ignored and must not be committed.
+
+## Included Customization
+
+The image adds a small idempotent first-start setup that installs or configures:
+
+- Discord Flatpak: `com.discordapp.Discord`
+- Google Chrome Flatpak: `com.google.Chrome`
+- VLC Flatpak: `org.videolan.VLC`
+- Decky Loader via Bazzite's `ujust setup-decky install`
+- Decky plugins from the current Deckbrew store:
+  - SteamGridDB
+  - HLTB for Deck
+  - ProtonDB Badges
+
+The first-start setup writes a completion marker only after all requested setup steps succeed, so failed network or Decky attempts are retried by the timer.
+
+## Local Build
+
+From an Administrator PowerShell on the Windows host:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File "D:\Bazzite-Custom\run-local-bazzite-build-admin.ps1"
+```
+
+The helper script enters Fedora WSL2 as root and runs `scripts/build-bazzite-local-wsl.sh` / `D:\Bazzite-Custom\build-bazzite-local-wsl.sh`.
+
+GitHub Actions are left as manual-only template references and should not be used for this private local build.
+
+## Template Reference
+
 # image-template
 
 This repository is meant to be a template for building your own custom [bootc](https://github.com/bootc-dev/bootc) image. This template is the recommended way to make customizations to any image published by the Universal Blue Project.
