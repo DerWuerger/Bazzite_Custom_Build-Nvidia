@@ -6,7 +6,8 @@ param(
     [int]$CpuCount = 4,
     [int]$DiskSizeGb = 64,
     [switch]$RecreateDisk,
-    [switch]$UseTcgOnly
+    [switch]$UseTcgOnly,
+    [switch]$LegacyBios
 )
 
 Set-StrictMode -Version Latest
@@ -73,7 +74,7 @@ function Find-UefiFirmware {
 
     $qemuDir = Split-Path -Parent $QemuExe
     $root = Split-Path -Parent $qemuDir
-    $patterns = @(
+    $codePatterns = @(
         "share\edk2-x86_64-code.fd",
         "share\qemu\edk2-x86_64-code.fd",
         "share\edk2-x86_64-secure-code.fd",
@@ -81,13 +82,41 @@ function Find-UefiFirmware {
         "share\OVMF_CODE.fd",
         "share\qemu\OVMF_CODE.fd"
     )
+    $varsPatterns = @(
+        "share\edk2-x86_64-vars.fd",
+        "share\qemu\edk2-x86_64-vars.fd",
+        "share\OVMF_VARS.fd",
+        "share\qemu\OVMF_VARS.fd"
+    )
 
+    $code = $null
+    $vars = $null
     foreach ($base in @($qemuDir, $root)) {
-        foreach ($pattern in $patterns) {
+        foreach ($pattern in $codePatterns) {
             $candidate = Join-Path $base $pattern
             if (Test-Path -LiteralPath $candidate -PathType Leaf) {
-                return (Resolve-Path -LiteralPath $candidate).Path
+                $code = (Resolve-Path -LiteralPath $candidate).Path
+                break
             }
+        }
+        if ($code) { break }
+    }
+
+    foreach ($base in @($qemuDir, $root)) {
+        foreach ($pattern in $varsPatterns) {
+            $candidate = Join-Path $base $pattern
+            if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+                $vars = (Resolve-Path -LiteralPath $candidate).Path
+                break
+            }
+        }
+        if ($vars) { break }
+    }
+
+    if ($code -and $vars) {
+        return [pscustomobject]@{
+            Code = $code
+            Vars = $vars
         }
     }
     return $null
@@ -115,7 +144,10 @@ if (-not $UseTcgOnly -and (Test-HypervisorPlatformEnabled)) {
     $accel = "whpx"
 }
 
-$uefi = Find-UefiFirmware -QemuExe $qemu
+$uefi = $null
+if (-not $LegacyBios) {
+    $uefi = Find-UefiFirmware -QemuExe $qemu
+}
 $varsPath = Join-Path $WorkDir "OVMF_VARS.fd"
 
 $args = @(
@@ -124,7 +156,7 @@ $args = @(
     "-cpu", "max",
     "-smp", "$CpuCount",
     "-m", "$MemoryMb",
-    "-device", "virtio-vga",
+    "-vga", "std",
     "-device", "qemu-xhci",
     "-device", "usb-kbd",
     "-device", "usb-tablet",
@@ -132,16 +164,16 @@ $args = @(
     "-device", "virtio-net-pci,netdev=net0",
     "-drive", "file=$diskPath,if=virtio,format=qcow2",
     "-drive", "file=$IsoPath,media=cdrom,readonly=on,index=2",
-    "-boot", "d",
+    "-boot", "order=d,menu=on",
     "-display", "default"
 )
 
 if ($uefi) {
     if (-not (Test-Path -LiteralPath $varsPath -PathType Leaf)) {
-        Copy-Item -LiteralPath $uefi -Destination $varsPath
+        Copy-Item -LiteralPath $uefi.Vars -Destination $varsPath
     }
     $args = @(
-        "-drive", "if=pflash,format=raw,readonly=on,file=$uefi",
+        "-drive", "if=pflash,format=raw,readonly=on,file=$($uefi.Code)",
         "-drive", "if=pflash,format=raw,file=$varsPath"
     ) + $args
     Write-Step "Starting QEMU boot test with UEFI and $accel acceleration"
