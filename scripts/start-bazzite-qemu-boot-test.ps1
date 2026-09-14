@@ -7,7 +7,8 @@ param(
     [int]$DiskSizeGb = 64,
     [switch]$RecreateDisk,
     [switch]$UseTcgOnly,
-    [switch]$LegacyBios
+    [switch]$LegacyBios,
+    [switch]$BootInstalledDisk
 )
 
 Set-StrictMode -Version Latest
@@ -129,6 +130,10 @@ $qemu = Resolve-QemuTool -FileName "qemu-system-x86_64.exe"
 $qemuImg = Resolve-QemuTool -FileName "qemu-img.exe"
 $diskPath = Join-Path $WorkDir $DiskName
 
+if ($RecreateDisk -and $BootInstalledDisk) {
+    throw "Do not combine -RecreateDisk with -BootInstalledDisk. The installed test system lives on the existing qcow2 disk."
+}
+
 if ($RecreateDisk -and (Test-Path -LiteralPath $diskPath -PathType Leaf)) {
     Write-Step "Removing old disposable test disk"
     Remove-Item -LiteralPath $diskPath -Force
@@ -163,12 +168,22 @@ $args = @(
     "-netdev", "user,id=net0",
     "-device", "virtio-net-pci,netdev=net0",
     "-drive", "file=$diskPath,if=virtio,format=qcow2",
-    "-drive", "file=$IsoPath,media=cdrom,readonly=on,index=2",
-    "-boot", "order=d,menu=on",
     "-display", "default"
 )
 
+if ($BootInstalledDisk) {
+    $args += @("-boot", "order=c,menu=on")
+} else {
+    $args += @(
+        "-drive", "file=$IsoPath,media=cdrom,readonly=on,index=2",
+        "-boot", "order=d,menu=on"
+    )
+}
+
 if ($uefi) {
+    if ($RecreateDisk -and (Test-Path -LiteralPath $varsPath -PathType Leaf)) {
+        Remove-Item -LiteralPath $varsPath -Force
+    }
     if (-not (Test-Path -LiteralPath $varsPath -PathType Leaf)) {
         Copy-Item -LiteralPath $uefi.Vars -Destination $varsPath
     }
@@ -181,6 +196,11 @@ if ($uefi) {
     Write-Step "Starting QEMU boot test with legacy BIOS and $accel acceleration"
 }
 
+if ($BootInstalledDisk) {
+    Write-Host "Mode: Boot installed test system from disk"
+} else {
+    Write-Host "Mode: Boot installer ISO"
+}
 Write-Host "ISO:  $IsoPath"
 Write-Host "Disk: $diskPath"
 Write-Host "QEMU: $qemu"
